@@ -24,7 +24,7 @@ let package = Package(
         ),
         .binaryTarget(
             name: "FjsBinary",
-            path: "Binaries/fjs.xcframework.zip"
+            path: "Binaries/fjs.xcframework"
         )
     ]
 )

@@ -8,129 +8,108 @@ use crate::api::module::{
     DynamicModuleEntry, DynamicModuleLoader, DynamicModuleResolver, DynamicModuleStorage,
     GlobalAttachment, LoadedDynamicModules, ModuleBuilder, get_available_module_names,
 };
-use crate::api::source::{
-    JsBuiltinOptions, JsCode, JsEvalOptions, JsModule, get_raw_source_code,
-    get_raw_source_code_sync,
-};
+use crate::api::source::{JsBuiltinOptions, JsEvalOptions, JsModule, get_raw_source_code};
 use crate::api::value::{JsValue, install_value_intrinsics};
 use crate::runtime::driver::DriverErrorSource;
-use crate::runtime::shutdown::RuntimeShutdown;
 use flutter_rust_bridge::frb;
 use rquickjs::loader::{BuiltinLoader, BuiltinResolver, FileResolver, NativeLoader, ScriptLoader};
 use rquickjs::promise::MaybePromise;
 use rquickjs::{CatchResultExt, FromJs, Module, Promise};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Instant;
 
-fn file_eval_options(path: &str, options: JsEvalOptions) -> rquickjs::context::EvalOptions {
-    let mut options: rquickjs::context::EvalOptions = options.into();
-    options.filename = Some(std::path::Path::new(path).file_name().map_or_else(
-        || path.to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    ));
-    options
+static EXECUTION_EPOCH: OnceLock<Instant> = OnceLock::new();
+static NEXT_INTERNAL_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn monotonic_nanos() -> u64 {
+    let elapsed = EXECUTION_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos();
+    u64::try_from(elapsed).unwrap_or(u64::MAX)
 }
 
-#[cfg(test)]
-struct RuntimeDropBarrier {
-    lifetime: std::sync::Weak<()>,
-    barrier: Arc<std::sync::Barrier>,
+/// Shared lock-free state read by QuickJS's interrupt callback.
+#[derive(Default)]
+pub(crate) struct ExecutionControl {
+    current_request: AtomicU64,
+    deadline_nanos: AtomicU64,
+    cancelled_request: AtomicU64,
 }
 
-#[cfg(test)]
-static RUNTIME_DROP_BARRIER: std::sync::Mutex<Option<RuntimeDropBarrier>> =
-    std::sync::Mutex::new(None);
+impl ExecutionControl {
+    fn should_interrupt(&self) -> bool {
+        let request = self.current_request.load(Ordering::Relaxed);
+        if request == 0 {
+            return false;
+        }
+        if self.cancelled_request.load(Ordering::Relaxed) == request {
+            return true;
+        }
+        let deadline = self.deadline_nanos.load(Ordering::Relaxed);
+        deadline != 0 && monotonic_nanos() >= deadline
+    }
 
-#[cfg(test)]
-struct ContextDropOrderBarrier {
-    lifetime: std::sync::Weak<()>,
-    first_paused: Arc<std::sync::Barrier>,
-    release_first: Arc<std::sync::Barrier>,
-}
-
-#[cfg(test)]
-static CONTEXT_DROP_ORDER_BARRIER: std::sync::Mutex<Option<ContextDropOrderBarrier>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-fn wait_at_runtime_drop_barrier(lifetime: &Arc<()>) {
-    let barrier = RUNTIME_DROP_BARRIER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .filter(|hook| hook.lifetime.as_ptr() == Arc::as_ptr(lifetime))
-        .map(|hook| hook.barrier.clone());
-    if let Some(barrier) = barrier {
-        barrier.wait();
+    fn start(
+        self: &Arc<Self>,
+        request_id: u64,
+        timeout_ms: u64,
+    ) -> Result<ExecutionLease, JsError> {
+        if request_id == 0 || timeout_ms == 0 {
+            return Err(JsError::generic(
+                "execution request id and timeout must be positive",
+            ));
+        }
+        self.cancelled_request.store(0, Ordering::Relaxed);
+        self.current_request
+            .compare_exchange(0, request_id, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| JsError::generic("another execution budget is active"))?;
+        let timeout_nanos = timeout_ms.saturating_mul(1_000_000);
+        self.deadline_nanos.store(
+            monotonic_nanos().saturating_add(timeout_nanos),
+            Ordering::Release,
+        );
+        Ok(ExecutionLease {
+            control: Arc::clone(self),
+            request_id,
+            timeout_ms,
+        })
     }
 }
 
-fn take_last_owner(lifetime: &mut Option<Arc<()>>) -> bool {
-    // Unlike a strong-count check followed by drop, concurrent `into_inner`
-    // calls guarantee that exactly one consumed token becomes the final owner.
-    lifetime.take().and_then(Arc::into_inner).is_some()
+struct ExecutionLease {
+    control: Arc<ExecutionControl>,
+    request_id: u64,
+    timeout_ms: u64,
 }
 
-#[cfg(test)]
-pub(crate) fn install_runtime_drop_barrier(lifetime: &Arc<()>) {
-    *RUNTIME_DROP_BARRIER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RuntimeDropBarrier {
-        lifetime: Arc::downgrade(lifetime),
-        barrier: Arc::new(std::sync::Barrier::new(2)),
-    });
-}
-
-#[cfg(test)]
-pub(crate) fn clear_runtime_drop_barrier() {
-    RUNTIME_DROP_BARRIER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-}
-
-#[cfg(test)]
-fn pause_non_last_runtime_owner_before_context_drop(
-    context_lifetime: &Arc<()>,
-    is_last_runtime_owner: bool,
-) {
-    if is_last_runtime_owner {
-        return;
-    }
-    let barriers = CONTEXT_DROP_ORDER_BARRIER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .filter(|hook| hook.lifetime.as_ptr() == Arc::as_ptr(context_lifetime))
-        .map(|hook| (hook.first_paused.clone(), hook.release_first.clone()));
-    if let Some((first_paused, release_first)) = barriers {
-        first_paused.wait();
-        release_first.wait();
+impl ExecutionLease {
+    fn finish(self, result: JsResult) -> JsResult {
+        if self.control.cancelled_request.load(Ordering::Acquire) == self.request_id {
+            return JsResult::Err(JsError::cancelled(format!(
+                "execution {} was cancelled",
+                self.request_id
+            )));
+        }
+        if monotonic_nanos() >= self.control.deadline_nanos.load(Ordering::Acquire) {
+            return JsResult::Err(JsError::timeout("javascript evaluation", self.timeout_ms));
+        }
+        result
     }
 }
 
-#[cfg(test)]
-pub(crate) fn install_context_drop_order_barrier(
-    context_lifetime: &Arc<()>,
-) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
-    let first_paused = Arc::new(std::sync::Barrier::new(2));
-    let release_first = Arc::new(std::sync::Barrier::new(2));
-    *CONTEXT_DROP_ORDER_BARRIER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ContextDropOrderBarrier {
-        lifetime: Arc::downgrade(context_lifetime),
-        first_paused: first_paused.clone(),
-        release_first: release_first.clone(),
-    });
-    (first_paused, release_first)
-}
-
-#[cfg(test)]
-pub(crate) fn clear_context_drop_order_barrier() {
-    CONTEXT_DROP_ORDER_BARRIER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
+impl Drop for ExecutionLease {
+    fn drop(&mut self) {
+        self.control.deadline_nanos.store(0, Ordering::Release);
+        self.control.cancelled_request.store(0, Ordering::Release);
+        let _ = self.control.current_request.compare_exchange(
+            self.request_id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 /// Memory usage statistics for the JavaScript runtime.
@@ -155,10 +134,9 @@ pub(crate) fn clear_context_drop_order_barrier() {
 pub struct MemoryUsage(pub(crate) rquickjs::qjs::JSMemoryUsage);
 
 macro_rules! proxy_memory_usage_getter {
-    ($($name:ident => $doc:literal),+ $(,)?) => {
+    ($($name:ident),+) => {
         impl MemoryUsage {
             $(
-                #[doc = $doc]
                 #[frb(sync, getter)]
                 pub fn $name(&self) -> i64 { self.0.$name }
             )+
@@ -167,32 +145,32 @@ macro_rules! proxy_memory_usage_getter {
 }
 
 proxy_memory_usage_getter!(
-    malloc_size => "Returns the number of bytes currently reserved by QuickJS's allocator, including allocator overhead.",
-    malloc_limit => "Returns the configured QuickJS allocator limit in bytes.",
-    memory_used_size => "Returns QuickJS's estimated live runtime memory in bytes, excluding allocator overhead.",
-    malloc_count => "Returns the number of live allocations tracked by QuickJS's allocator.",
-    memory_used_count => "Returns the estimated number of live allocations represented by `memory_used_size`.",
-    atom_count => "Returns the number of live interned atoms.",
-    atom_size => "Returns the estimated memory occupied by interned atoms, in bytes.",
-    str_count => "Returns the number of live JavaScript strings.",
-    str_size => "Returns the estimated memory occupied by JavaScript strings, in bytes.",
-    obj_count => "Returns the number of live JavaScript objects.",
-    obj_size => "Returns the estimated memory occupied by JavaScript object headers, in bytes.",
-    prop_count => "Returns the number of live object properties.",
-    prop_size => "Returns the estimated memory occupied by object property storage, in bytes.",
-    shape_count => "Returns the number of live QuickJS object shapes.",
-    shape_size => "Returns the estimated memory occupied by object shapes, in bytes.",
-    js_func_count => "Returns the number of live JavaScript bytecode functions.",
-    js_func_size => "Returns the estimated memory occupied by JavaScript function metadata and closures, in bytes.",
-    js_func_code_size => "Returns the total JavaScript function bytecode size, in bytes.",
-    js_func_pc2line_count => "Returns the number of JavaScript functions that have source-position tables.",
-    js_func_pc2line_size => "Returns the total size of JavaScript source-position tables, in bytes.",
-    c_func_count => "Returns the number of live native C function objects exposed to JavaScript.",
-    array_count => "Returns the number of live JavaScript arrays.",
-    fast_array_count => "Returns the number of live arrays using QuickJS's dense fast-array representation.",
-    fast_array_elements => "Returns the number of elements stored across dense fast arrays.",
-    binary_object_count => "Returns the number of binary objects deserialized by QuickJS contexts in this runtime.",
-    binary_object_size => "Returns the total input size, in bytes, of binary objects deserialized by QuickJS contexts in this runtime."
+    malloc_size,
+    malloc_limit,
+    memory_used_size,
+    malloc_count,
+    memory_used_count,
+    atom_count,
+    atom_size,
+    str_count,
+    str_size,
+    obj_count,
+    obj_size,
+    prop_count,
+    prop_size,
+    shape_count,
+    shape_size,
+    js_func_count,
+    js_func_size,
+    js_func_code_size,
+    js_func_pc2line_count,
+    js_func_pc2line_size,
+    c_func_count,
+    array_count,
+    fast_array_count,
+    fast_array_elements,
+    binary_object_count,
+    binary_object_size
 );
 
 impl MemoryUsage {
@@ -318,6 +296,7 @@ fn install_default_async_loaders(runtime: &rquickjs::AsyncRuntime) {
 pub struct JsRuntime {
     pub(crate) rt: rquickjs::Runtime,
     pub(crate) global_attachment: Option<GlobalAttachment>,
+    pub(crate) execution_control: Arc<ExecutionControl>,
 }
 
 impl JsRuntime {
@@ -338,6 +317,9 @@ impl JsRuntime {
     #[frb(sync)]
     pub fn new() -> Result<Self, JsError> {
         let runtime = rquickjs::Runtime::new()?;
+        let execution_control = Arc::new(ExecutionControl::default());
+        let interrupt_control = Arc::clone(&execution_control);
+        runtime.set_interrupt_handler(Some(Box::new(move || interrupt_control.should_interrupt())));
         runtime.set_max_stack_size(crate::runtime::stack::SYNC_MAX_STACK_SIZE);
         let (module_resolver, module_loader, _) = ModuleBuilder::new().build();
         let (resolver, loader) = make_loader_stack(
@@ -350,6 +332,7 @@ impl JsRuntime {
         Ok(Self {
             rt: runtime,
             global_attachment: None,
+            execution_control,
         })
     }
 
@@ -381,6 +364,9 @@ impl JsRuntime {
         modules: Option<Vec<JsModule>>,
     ) -> Result<Self, JsError> {
         let runtime = rquickjs::Runtime::new()?;
+        let execution_control = Arc::new(ExecutionControl::default());
+        let interrupt_control = Arc::clone(&execution_control);
+        runtime.set_interrupt_handler(Some(Box::new(move || interrupt_control.should_interrupt())));
         runtime.set_max_stack_size(crate::runtime::stack::SYNC_MAX_STACK_SIZE);
         let (
             module_resolver,
@@ -401,6 +387,7 @@ impl JsRuntime {
         Ok(Self {
             rt: runtime,
             global_attachment: Some(global_attachment),
+            execution_control,
         })
     }
 
@@ -630,6 +617,7 @@ impl JsRuntime {
 pub struct JsContext {
     pub(crate) ctx: rquickjs::Context,
     pub(crate) global_attachment: Option<GlobalAttachment>,
+    execution_control: Arc<ExecutionControl>,
 }
 
 impl JsContext {
@@ -663,6 +651,7 @@ impl JsContext {
         Ok(Self {
             ctx: context,
             global_attachment: runtime.global_attachment.clone(),
+            execution_control: Arc::clone(&runtime.execution_control),
         })
     }
 
@@ -688,6 +677,19 @@ impl JsContext {
     #[frb(sync)]
     pub fn eval(&self, code: String) -> JsResult {
         self.eval_with_options(code, JsEvalOptions::defaults())
+    }
+
+    /// Evaluates synchronous JavaScript with a QuickJS interrupt deadline.
+    #[frb(sync)]
+    pub fn eval_with_timeout(&self, code: String, timeout_ms: u64) -> JsResult {
+        let request_id = NEXT_INTERNAL_REQUEST_ID
+            .fetch_add(1, Ordering::Relaxed)
+            .max(1);
+        let lease = match self.execution_control.start(request_id, timeout_ms) {
+            Ok(lease) => lease,
+            Err(error) => return JsResult::Err(error),
+        };
+        lease.finish(self.eval_with_options(code, JsEvalOptions::defaults()))
     }
 
     /// Evaluates JavaScript code with options.
@@ -779,11 +781,6 @@ impl JsContext {
         if options.promise.unwrap_or(false) {
             return JsResult::Err(JsError::promise("Promise not supported in sync context"));
         }
-        let source = match get_raw_source_code_sync(JsCode::Path(path.clone())) {
-            Ok(source) => source,
-            Err(error) => return JsResult::Err(error),
-        };
-        let options = file_eval_options(&path, options);
         self.ctx.with(|ctx| {
             if let Some(attachment) = &self.global_attachment {
                 if let Err(e) = attachment.attach(&ctx) {
@@ -793,7 +790,7 @@ impl JsContext {
                     )));
                 }
             }
-            let res = ctx.eval_with_options(source, options);
+            let res = ctx.eval_file_with_options(path, options.into());
             result_from_sync(&ctx, res)
         })
     }
@@ -832,9 +829,9 @@ pub struct JsAsyncRuntime {
     pub(crate) rt: rquickjs::AsyncRuntime,
     pub(crate) global_attachment: Option<GlobalAttachment>,
     pub(crate) driver: crate::runtime::driver::DriverController,
-    pub(crate) shutdown: RuntimeShutdown,
     pub(crate) cleaned: Arc<AtomicBool>,
-    pub(crate) runtime_lifetime: Option<Arc<()>>,
+    pub(crate) runtime_lifetime: Arc<()>,
+    pub(crate) execution_control: Arc<ExecutionControl>,
 }
 
 impl JsAsyncRuntime {
@@ -879,25 +876,27 @@ impl JsAsyncRuntime {
     #[frb(sync)]
     pub fn new() -> Result<Self, JsError> {
         let runtime = rquickjs::AsyncRuntime::new()?;
+        let execution_control = Arc::new(ExecutionControl::default());
+        let interrupt_control = Arc::clone(&execution_control);
+        futures::executor::block_on(
+            runtime.set_interrupt_handler(Some(Box::new(move || {
+                interrupt_control.should_interrupt()
+            }))),
+        );
         crate::runtime::error_sink::install_llrt_spawn_error_handler();
         futures::executor::block_on(
             runtime.set_max_stack_size(crate::runtime::stack::ASYNC_MAX_STACK_SIZE),
         );
         let driver = crate::runtime::driver::DriverController::default();
         futures::executor::block_on(Self::install_error_tracker(&runtime, driver.clone()));
-        let shutdown = RuntimeShutdown::default();
-        let interrupt_shutdown = shutdown.clone();
-        futures::executor::block_on(
-            runtime.set_interrupt_handler(Some(Box::new(move || interrupt_shutdown.requested()))),
-        );
         install_default_async_loaders(&runtime);
         let runtime = Self {
             rt: runtime,
             global_attachment: None,
             driver,
-            shutdown,
             cleaned: Arc::new(AtomicBool::new(false)),
-            runtime_lifetime: Some(Arc::new(())),
+            runtime_lifetime: Arc::new(()),
+            execution_control,
         };
         runtime.start_driver_now();
         Ok(runtime)
@@ -931,17 +930,17 @@ impl JsAsyncRuntime {
         modules: Option<Vec<JsModule>>,
     ) -> Result<Self, JsError> {
         let runtime = rquickjs::AsyncRuntime::new()?;
+        let execution_control = Arc::new(ExecutionControl::default());
+        let interrupt_control = Arc::clone(&execution_control);
+        runtime
+            .set_interrupt_handler(Some(Box::new(move || interrupt_control.should_interrupt())))
+            .await;
         crate::runtime::error_sink::install_llrt_spawn_error_handler();
         runtime
             .set_max_stack_size(crate::runtime::stack::ASYNC_MAX_STACK_SIZE)
             .await;
         let driver = crate::runtime::driver::DriverController::default();
         Self::install_error_tracker(&runtime, driver.clone()).await;
-        let shutdown = RuntimeShutdown::default();
-        let interrupt_shutdown = shutdown.clone();
-        runtime
-            .set_interrupt_handler(Some(Box::new(move || interrupt_shutdown.requested())))
-            .await;
         let (
             module_resolver,
             module_loader,
@@ -962,9 +961,9 @@ impl JsAsyncRuntime {
             rt: runtime,
             global_attachment: Some(global_attachment),
             driver,
-            shutdown,
             cleaned: Arc::new(AtomicBool::new(false)),
-            runtime_lifetime: Some(Arc::new(())),
+            runtime_lifetime: Arc::new(()),
+            execution_control,
         };
         runtime.start_driver_now();
         Ok(runtime)
@@ -973,18 +972,13 @@ impl JsAsyncRuntime {
     pub(crate) async fn cleanup_once(
         runtime: rquickjs::AsyncRuntime,
         driver: crate::runtime::driver::DriverController,
-        shutdown: RuntimeShutdown,
         cleaned: Arc<AtomicBool>,
     ) {
         if cleaned.swap(true, Ordering::AcqRel) {
             return;
         }
 
-        shutdown.request();
         driver.stop().await;
-        if runtime.is_job_pending().await {
-            runtime.idle().await;
-        }
         runtime.run_gc().await;
     }
 
@@ -999,13 +993,12 @@ impl JsAsyncRuntime {
     fn finalize_runtime_drop(
         runtime: rquickjs::AsyncRuntime,
         driver: crate::runtime::driver::DriverController,
-        shutdown: RuntimeShutdown,
         cleaned: Arc<AtomicBool>,
     ) {
         // Drop must never block the calling thread (often the Dart main
         // thread); cleanup runs detached on the JS executor instead.
         crate::runtime::executor::spawn_js(async move {
-            JsAsyncRuntime::cleanup_once(runtime, driver, shutdown, cleaned).await;
+            JsAsyncRuntime::cleanup_once(runtime, driver, cleaned).await;
         });
     }
 
@@ -1013,7 +1006,6 @@ impl JsAsyncRuntime {
         context: rquickjs::AsyncContext,
         runtime: rquickjs::AsyncRuntime,
         driver: crate::runtime::driver::DriverController,
-        shutdown: RuntimeShutdown,
         cleaned: Arc<AtomicBool>,
         is_last_runtime_owner: bool,
     ) {
@@ -1021,17 +1013,9 @@ impl JsAsyncRuntime {
             drop(context);
             JsAsyncRuntime::cleanup_after_context_drop(runtime.clone()).await;
             if is_last_runtime_owner {
-                JsAsyncRuntime::cleanup_once(runtime, driver, shutdown, cleaned).await;
+                JsAsyncRuntime::cleanup_once(runtime, driver, cleaned).await;
             }
         });
-    }
-
-    pub(crate) fn request_shutdown(&self) {
-        self.shutdown.request();
-    }
-
-    pub(crate) fn shutdown(&self) -> RuntimeShutdown {
-        self.shutdown.clone()
     }
 
     /// Sets the memory limit.
@@ -1250,19 +1234,14 @@ impl JsAsyncRuntime {
 
 impl Drop for JsAsyncRuntime {
     fn drop(&mut self) {
-        #[cfg(test)]
-        if let Some(lifetime) = &self.runtime_lifetime {
-            wait_at_runtime_drop_barrier(lifetime);
-        }
-        if !take_last_owner(&mut self.runtime_lifetime) {
+        if Arc::strong_count(&self.runtime_lifetime) != 1 {
             return;
         }
 
         let runtime = self.rt.clone();
         let driver = self.driver.clone();
-        let shutdown = self.shutdown.clone();
         let cleaned = self.cleaned.clone();
-        JsAsyncRuntime::finalize_runtime_drop(runtime, driver, shutdown, cleaned);
+        JsAsyncRuntime::finalize_runtime_drop(runtime, driver, cleaned);
     }
 }
 
@@ -1286,11 +1265,11 @@ pub struct JsAsyncContext {
     pub(crate) ctx: Option<rquickjs::AsyncContext>,
     pub(crate) runtime: rquickjs::AsyncRuntime,
     pub(crate) driver: crate::runtime::driver::DriverController,
-    pub(crate) shutdown: RuntimeShutdown,
     pub(crate) cleaned: Arc<AtomicBool>,
-    pub(crate) runtime_lifetime: Option<Arc<()>>,
-    pub(crate) context_lifetime: Option<Arc<()>>,
+    pub(crate) runtime_lifetime: Arc<()>,
+    pub(crate) context_lifetime: Arc<()>,
     pub(crate) global_attachment: Option<GlobalAttachment>,
+    execution_control: Arc<ExecutionControl>,
 }
 
 impl JsAsyncContext {
@@ -1307,9 +1286,6 @@ impl JsAsyncContext {
     }
 
     fn ensure_no_unhandled_job_errors(&self) -> Result<(), JsError> {
-        if self.shutdown.requested() {
-            return Err(self.shutdown.error());
-        }
         if let Some(error) = self.take_unhandled_job_error() {
             Err(error)
         } else {
@@ -1321,18 +1297,9 @@ impl JsAsyncContext {
     where
         F: for<'js> AsyncFnOnce(rquickjs::Ctx<'js>, u64) -> JsResult + Send + 'static,
     {
-        if self.shutdown.requested() {
-            return JsResult::Err(self.shutdown.error());
-        }
         let checkpoint = self.driver.error_checkpoint();
-        let shutdown = self.shutdown.clone();
-        self.with_js(async move |ctx| {
-            if shutdown.requested() {
-                return JsResult::Err(shutdown.error());
-            }
-            f(ctx, checkpoint).await
-        })
-        .await
+        self.with_js(async move |ctx| f(ctx, checkpoint).await)
+            .await
     }
 
     pub(crate) async fn with_js<F, R>(&self, f: F) -> R
@@ -1422,11 +1389,11 @@ impl JsAsyncContext {
             ctx: Some(context),
             runtime: runtime.rt.clone(),
             driver: runtime.driver.clone(),
-            shutdown: runtime.shutdown.clone(),
             cleaned: runtime.cleaned.clone(),
             runtime_lifetime: runtime.runtime_lifetime.clone(),
-            context_lifetime: Some(Arc::new(())),
+            context_lifetime: Arc::new(()),
             global_attachment: runtime.global_attachment.clone(),
+            execution_control: Arc::clone(&runtime.execution_control),
         })
     }
 
@@ -1473,16 +1440,12 @@ impl JsAsyncContext {
     /// - If code evaluation fails
     /// - If global attachment fails
     pub async fn eval_with_options(&self, code: String, options: JsEvalOptions) -> JsResult {
-        if self.shutdown.requested() {
-            return JsResult::Err(self.shutdown.error());
-        }
         if let Some(error) = self.take_unhandled_job_error() {
             return JsResult::Err(error);
         }
 
         let attachment = self.global_attachment.clone();
         let driver = self.driver.clone();
-        let shutdown = self.shutdown.clone();
         self.with_foreground_js_result(async move |ctx, checkpoint| {
             if let Some(attachment) = &attachment
                 && let Err(e) = attachment.attach(&ctx)
@@ -1493,12 +1456,48 @@ impl JsAsyncContext {
             options.promise = Some(true);
             let res = ctx.eval_with_options(code, options.into());
             let driver = driver.clone();
-            result_from_promise(&ctx, res, shutdown, move |source| {
+            result_from_promise(&ctx, res, move |source| {
                 driver.remove_error_source_since(checkpoint, source);
             })
             .await
         })
         .await
+    }
+
+    /// Evaluates JavaScript with a host visible deadline and cancellation id.
+    pub async fn eval_with_budget(
+        &self,
+        code: String,
+        timeout_ms: u64,
+        request_id: u64,
+    ) -> JsResult {
+        let lease = match self.execution_control.start(request_id, timeout_ms) {
+            Ok(lease) => lease,
+            Err(error) => return JsResult::Err(error),
+        };
+        lease.finish(
+            self.eval_with_options(code, JsEvalOptions::with_promise())
+                .await,
+        )
+    }
+
+    /// Requests cancellation of the active evaluation with this request id.
+    #[frb(sync)]
+    pub fn cancel_evaluation(&self, request_id: u64) -> bool {
+        if request_id != 0
+            && self
+                .execution_control
+                .current_request
+                .load(Ordering::Acquire)
+                == request_id
+        {
+            self.execution_control
+                .cancelled_request
+                .store(request_id, Ordering::Release);
+            true
+        } else {
+            false
+        }
     }
 
     /// Evaluates JavaScript code from a file.
@@ -1548,33 +1547,23 @@ impl JsAsyncContext {
     /// - If file cannot be read
     /// - If code evaluation fails
     pub async fn eval_file_with_options(&self, path: String, options: JsEvalOptions) -> JsResult {
-        if self.shutdown.requested() {
-            return JsResult::Err(self.shutdown.error());
-        }
         if let Some(error) = self.take_unhandled_job_error() {
             return JsResult::Err(error);
         }
 
-        let source = match get_raw_source_code(JsCode::Path(path.clone())).await {
-            Ok(source) => source,
-            Err(error) => return JsResult::Err(error),
-        };
-        let mut options = options;
-        options.promise = Some(true);
-        let options = file_eval_options(&path, options);
-
         let attachment = self.global_attachment.clone();
         let driver = self.driver.clone();
-        let shutdown = self.shutdown.clone();
         self.with_foreground_js_result(async move |ctx, checkpoint| {
             if let Some(attachment) = &attachment
                 && let Err(e) = attachment.attach(&ctx)
             {
                 return JsResult::Err(JsError::context(e.to_string()));
             }
-            let res = ctx.eval_with_options(source, options);
+            let mut options = options;
+            options.promise = Some(true);
+            let res = ctx.eval_file_with_options(path, options.into());
             let driver = driver.clone();
-            result_from_promise(&ctx, res, shutdown, move |source| {
+            result_from_promise(&ctx, res, move |source| {
                 driver.remove_error_source_since(checkpoint, source);
             })
             .await
@@ -1618,9 +1607,6 @@ impl JsAsyncContext {
         method: String,
         params: Option<Vec<JsValue>>,
     ) -> JsResult {
-        if self.shutdown.requested() {
-            return JsResult::Err(self.shutdown.error());
-        }
         if let Some(error) = self.take_unhandled_job_error() {
             return JsResult::Err(error);
         }
@@ -1628,7 +1614,6 @@ impl JsAsyncContext {
         let params = params.unwrap_or_default();
         let attachment = self.global_attachment.clone();
         let driver = self.driver.clone();
-        let shutdown = self.shutdown.clone();
         self.with_foreground_js_result(async move |ctx, checkpoint| {
             if let Some(attachment) = &attachment
                 && let Err(e) = attachment.attach(&ctx)
@@ -1639,7 +1624,7 @@ impl JsAsyncContext {
                 )));
             }
             let driver = driver.clone();
-            call_module_method(&ctx, module, method, params, shutdown, move |source| {
+            call_module_method(&ctx, module, method, params, move |source| {
                 driver.remove_error_source_since(checkpoint, source);
             })
             .await
@@ -1668,24 +1653,7 @@ impl JsAsyncContext {
 
 impl Drop for JsAsyncContext {
     fn drop(&mut self) {
-        #[cfg(test)]
-        if let Some(lifetime) = &self.runtime_lifetime {
-            wait_at_runtime_drop_barrier(lifetime);
-        }
-        let is_last_runtime_owner = take_last_owner(&mut self.runtime_lifetime);
-        #[cfg(test)]
-        if let Some(lifetime) = &self.context_lifetime {
-            pause_non_last_runtime_owner_before_context_drop(lifetime, is_last_runtime_owner);
-        }
-        if !take_last_owner(&mut self.context_lifetime) {
-            if is_last_runtime_owner {
-                JsAsyncRuntime::finalize_runtime_drop(
-                    self.runtime.clone(),
-                    self.driver.clone(),
-                    self.shutdown.clone(),
-                    self.cleaned.clone(),
-                );
-            }
+        if Arc::strong_count(&self.context_lifetime) != 1 {
             return;
         }
 
@@ -1694,13 +1662,12 @@ impl Drop for JsAsyncContext {
         };
         let runtime = self.runtime.clone();
         let driver = self.driver.clone();
-        let shutdown = self.shutdown.clone();
         let cleaned = self.cleaned.clone();
+        let is_last_runtime_owner = Arc::strong_count(&self.runtime_lifetime) == 1;
         JsAsyncRuntime::finalize_context_drop(
             context,
             runtime,
             driver,
-            shutdown,
             cleaned,
             is_last_runtime_owner,
         );
@@ -1713,7 +1680,6 @@ pub(crate) async fn call_module_method<'js>(
     module: String,
     method: String,
     params: Vec<JsValue>,
-    shutdown: RuntimeShutdown,
     acknowledge_error_source: impl Fn(DriverErrorSource),
 ) -> JsResult {
     let promise = match Module::import(ctx, module.clone()).catch(ctx) {
@@ -1728,16 +1694,14 @@ pub(crate) async fn call_module_method<'js>(
     };
 
     let import_source = DriverErrorSource::promise(promise.as_ref());
-    let module_value = match promise_value(ctx, promise, shutdown.clone()).await {
+    let module_value = match promise.into_future::<rquickjs::Value>().await.catch(ctx) {
         Ok(v) => v,
         Err(e) => {
-            if !matches!(e, JsError::Cancelled(_)) {
-                acknowledge_error_source(import_source);
-            }
+            acknowledge_error_source(import_source);
             return JsResult::Err(JsError::module(
                 Some(module),
                 None,
-                format!("Failed to import: {e}"),
+                format!("Failed to import: {}", e),
             ));
         }
     };
@@ -1782,7 +1746,7 @@ pub(crate) async fn call_module_method<'js>(
     };
 
     let res = func.call::<_, MaybePromise>((rquickjs::function::Rest(params),));
-    result_from_maybe_promise(ctx, res, shutdown, acknowledge_error_source).await
+    result_from_maybe_promise(ctx, res, acknowledge_error_source).await
 }
 
 /// Helper function to convert sync result.
@@ -1803,25 +1767,19 @@ fn result_from_sync<'js>(
 pub(crate) async fn result_from_promise<'js>(
     ctx: &rquickjs::Ctx<'js>,
     res: rquickjs::Result<Promise<'js>>,
-    shutdown: RuntimeShutdown,
     acknowledge_error_source: impl Fn(DriverErrorSource),
 ) -> JsResult {
     match res.catch(ctx) {
         Ok(promise) => {
             let source = DriverErrorSource::promise(promise.as_ref());
-            match promise_value(ctx, promise, shutdown.clone()).await {
-                Ok(value) => {
-                    result_from_value(ctx, value, shutdown, acknowledge_error_source).await
-                }
+            match promise.into_future::<rquickjs::Value>().await.catch(ctx) {
+                Ok(value) => result_from_value(ctx, value, acknowledge_error_source).await,
                 Err(e) => {
-                    if !matches!(e, JsError::Cancelled(_)) {
-                        acknowledge_error_source(source);
-                    }
-                    JsResult::Err(e)
+                    acknowledge_error_source(source);
+                    JsResult::Err(JsError::from_caught(ctx, e))
                 }
             }
         }
-        Err(_) if shutdown.requested() => JsResult::Err(shutdown.error()),
         Err(e) => JsResult::Err(JsError::from_caught(ctx, e)),
     }
 }
@@ -1829,7 +1787,6 @@ pub(crate) async fn result_from_promise<'js>(
 pub(crate) async fn result_from_maybe_promise<'js>(
     ctx: &rquickjs::Ctx<'js>,
     res: rquickjs::Result<MaybePromise<'js>>,
-    shutdown: RuntimeShutdown,
     acknowledge_error_source: impl Fn(DriverErrorSource),
 ) -> JsResult {
     match res.catch(ctx) {
@@ -1838,32 +1795,21 @@ pub(crate) async fn result_from_maybe_promise<'js>(
                 .as_value()
                 .as_promise()
                 .map(|promise| DriverErrorSource::promise(promise.as_ref()));
-            match maybe_promise_value(ctx, value, shutdown.clone()).await {
-                Ok(value) => {
-                    result_from_value(ctx, value, shutdown, acknowledge_error_source).await
-                }
+            match value.into_future::<rquickjs::Value>().await.catch(ctx) {
+                Ok(value) => result_from_value(ctx, value, acknowledge_error_source).await,
                 Err(e) => {
-                    if !matches!(e, JsError::Cancelled(_))
-                        && let Some(source) = source
-                    {
+                    if let Some(source) = source {
                         acknowledge_error_source(source);
                     }
-                    JsResult::Err(e)
+                    JsResult::Err(JsError::from_caught(ctx, e))
                 }
             }
         }
-        Err(_) if shutdown.requested() => JsResult::Err(shutdown.error()),
         Err(e) => JsResult::Err(JsError::from_caught(ctx, e)),
     }
 }
 
-/// Normalizes the single-field wrapper produced by QuickJS async evaluation.
-///
-/// `JS_EVAL_FLAG_ASYNC` exposes its resolved result as an object whose only
-/// enumerable string key is `value`. Every asynchronous FJS result path uses
-/// this helper after resolving a Promise or MaybePromise. Objects with any
-/// additional enumerable string key are application values and stay intact.
-fn normalize_quickjs_async_result<'js>(value: &mut rquickjs::Value<'js>) -> rquickjs::Result<()> {
+fn unwrap_async_eval_value<'js>(value: &mut rquickjs::Value<'js>) -> rquickjs::Result<()> {
     let Some(obj) = value.as_object() else {
         return Ok(());
     };
@@ -1882,42 +1828,27 @@ fn normalize_quickjs_async_result<'js>(value: &mut rquickjs::Value<'js>) -> rqui
 async fn result_from_value<'js>(
     ctx: &rquickjs::Ctx<'js>,
     mut value: rquickjs::Value<'js>,
-    shutdown: RuntimeShutdown,
     acknowledge_error_source: impl Fn(DriverErrorSource),
 ) -> JsResult {
-    if shutdown.requested() {
-        return JsResult::Err(shutdown.error());
-    }
-    if let Err(e) = normalize_quickjs_async_result(&mut value).catch(ctx) {
-        if shutdown.requested() {
-            return JsResult::Err(shutdown.error());
-        }
+    if let Err(e) = unwrap_async_eval_value(&mut value).catch(ctx) {
         return JsResult::Err(JsError::from_caught(ctx, e));
     }
 
     while let Some(promise) = value.as_promise().cloned() {
         let source = DriverErrorSource::promise(promise.as_ref());
-        value = match promise_value(ctx, promise, shutdown.clone()).await {
+        value = match promise.into_future::<rquickjs::Value>().await.catch(ctx) {
             Ok(v) => v,
             Err(e) => {
-                if !matches!(e, JsError::Cancelled(_)) {
-                    acknowledge_error_source(source);
-                }
-                return JsResult::Err(e);
+                acknowledge_error_source(source);
+                return JsResult::Err(JsError::from_caught(ctx, e));
             }
         };
-        if let Err(e) = normalize_quickjs_async_result(&mut value).catch(ctx) {
-            if shutdown.requested() {
-                return JsResult::Err(shutdown.error());
-            }
+        if let Err(e) = unwrap_async_eval_value(&mut value).catch(ctx) {
             return JsResult::Err(JsError::from_caught(ctx, e));
         }
     }
 
     while ctx.execute_pending_job() {
-        if shutdown.requested() {
-            return JsResult::Err(shutdown.error());
-        }
         if ctx.has_exception() {
             return JsResult::Err(JsError::from_pending_exception(ctx));
         }
@@ -1925,80 +1856,38 @@ async fn result_from_value<'js>(
 
     match JsValue::from_js(ctx, value).catch(ctx) {
         Ok(v) => JsResult::Ok(v),
-        Err(_) if shutdown.requested() => JsResult::Err(shutdown.error()),
         Err(e) => JsResult::Err(JsError::from_caught(ctx, e)),
-    }
-}
-
-async fn promise_value<'js>(
-    ctx: &rquickjs::Ctx<'js>,
-    promise: Promise<'js>,
-    shutdown: RuntimeShutdown,
-) -> Result<rquickjs::Value<'js>, JsError> {
-    if shutdown.requested() {
-        return Err(shutdown.error());
-    }
-
-    tokio::select! {
-        result = promise.into_future::<rquickjs::Value>() => {
-            match result.catch(ctx) {
-                Ok(value) => Ok(value),
-                Err(_) if shutdown.requested() => Err(shutdown.error()),
-                Err(error) => Err(JsError::from_caught(ctx, error)),
-            }
-        }
-        _ = shutdown.cancelled() => Err(shutdown.error()),
-    }
-}
-
-async fn maybe_promise_value<'js>(
-    ctx: &rquickjs::Ctx<'js>,
-    value: MaybePromise<'js>,
-    shutdown: RuntimeShutdown,
-) -> Result<rquickjs::Value<'js>, JsError> {
-    if shutdown.requested() {
-        return Err(shutdown.error());
-    }
-
-    tokio::select! {
-        result = value.into_future::<rquickjs::Value>() => {
-            match result.catch(ctx) {
-                Ok(value) => Ok(value),
-                Err(_) if shutdown.requested() => Err(shutdown.error()),
-                Err(error) => Err(JsError::from_caught(ctx, error)),
-            }
-        }
-        _ = shutdown.cancelled() => Err(shutdown.error()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_quickjs_async_result;
+    use super::{JsAsyncContext, JsAsyncRuntime, JsContext, JsRuntime, unwrap_async_eval_value};
     use crate::api::value::JsValue;
     use rquickjs::{Context, FromJs, Runtime};
+    use std::sync::atomic::Ordering;
 
     #[test]
-    fn test_normalize_quickjs_async_result_wrapper_object() {
+    fn test_unwrap_async_eval_value_wrapper_object() {
         let runtime = Runtime::new().unwrap();
         let context = Context::full(&runtime).unwrap();
 
         context.with(|ctx| {
             let mut value: rquickjs::Value = ctx.eval("({ value: 42 })").unwrap();
-            normalize_quickjs_async_result(&mut value).unwrap();
+            unwrap_async_eval_value(&mut value).unwrap();
             let js_value = JsValue::from_js(&ctx, value).unwrap();
             assert!(matches!(js_value, JsValue::Integer(42)));
         });
     }
 
     #[test]
-    fn test_normalize_quickjs_async_result_preserves_multi_key_object() {
+    fn test_unwrap_async_eval_value_preserves_multi_key_object() {
         let runtime = Runtime::new().unwrap();
         let context = Context::full(&runtime).unwrap();
 
         context.with(|ctx| {
             let mut value: rquickjs::Value = ctx.eval("({ value: 42, extra: true })").unwrap();
-            normalize_quickjs_async_result(&mut value).unwrap();
+            unwrap_async_eval_value(&mut value).unwrap();
             let js_value = JsValue::from_js(&ctx, value).unwrap();
 
             assert!(matches!(
@@ -2008,5 +1897,61 @@ mod tests {
                         && matches!(obj.get("extra"), Some(JsValue::Boolean(true)))
             ));
         });
+    }
+
+    #[test]
+    fn sync_evaluation_deadline_interrupts_and_runtime_recovers() {
+        let runtime = JsRuntime::new().unwrap();
+        let context = JsContext::from(&runtime).unwrap();
+        let result = context.eval_with_timeout("while (true) {}".to_owned(), 20);
+        assert!(matches!(
+            result,
+            crate::api::error::JsResult::Err(crate::api::error::JsError::Timeout { .. })
+        ));
+        assert!(context.eval("6 * 7".to_owned()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn async_evaluation_deadline_interrupts_and_runtime_recovers() {
+        let runtime = JsAsyncRuntime::new().unwrap();
+        let context = JsAsyncContext::from(&runtime).await.unwrap();
+        let result = context
+            .eval_with_budget("while (true) {}".to_owned(), 20, 101)
+            .await;
+        assert!(matches!(
+            result,
+            crate::api::error::JsResult::Err(crate::api::error::JsError::Timeout { .. })
+        ));
+        assert!(context.eval("6 * 7".to_owned()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn async_evaluation_can_be_cancelled_by_request_id() {
+        let runtime = JsAsyncRuntime::new().unwrap();
+        let context = JsAsyncContext::from(&runtime).await.unwrap();
+        let evaluating = context.clone();
+        let task = tokio::spawn(async move {
+            evaluating
+                .eval_with_budget("while (true) {}".to_owned(), 5_000, 202)
+                .await
+        });
+        for _ in 0..100 {
+            if context
+                .execution_control
+                .current_request
+                .load(Ordering::Acquire)
+                == 202
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(context.cancel_evaluation(202));
+        let result = task.await.unwrap();
+        assert!(matches!(
+            result,
+            crate::api::error::JsResult::Err(crate::api::error::JsError::Cancelled(_))
+        ));
+        assert!(context.eval("6 * 7".to_owned()).await.is_ok());
     }
 }

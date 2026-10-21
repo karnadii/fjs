@@ -36,14 +36,10 @@ use std::sync::{Arc, RwLock};
 #[frb(ignore)]
 #[derive(Debug, Clone)]
 pub enum DynamicModuleEntry {
-    /// UTF-8 JavaScript source bytes compiled under the registered module name when loaded.
     Source(Vec<u8>),
-    /// QuickJS ES-module bytecode whose embedded module name must match the registered name.
     Bytecode(Vec<u8>),
 }
 
-// SAFETY: This type owns only Rust byte buffers and contains no context-bound
-// JavaScript handles, so changing the marker lifetime cannot invalidate data.
 unsafe impl<'js> JsLifetime<'js> for DynamicModuleEntry {
     type Changed<'to> = DynamicModuleEntry;
 }
@@ -71,8 +67,6 @@ pub struct LoadedDynamicModules {
     names: RwLock<HashSet<String>>,
 }
 
-// SAFETY: This type owns only a lock-protected set of Rust strings and contains
-// no context-bound JavaScript handles, so it is unchanged across JS lifetimes.
 unsafe impl<'js> JsLifetime<'js> for LoadedDynamicModules {
     type Changed<'to> = LoadedDynamicModules;
 }
@@ -123,9 +117,8 @@ pub(crate) fn get_loaded_dynamic_module_names(ctx: &Ctx<'_>) -> Vec<String> {
 
 /// Resolves a relative specifier (`./x`, `../y`) against the importing
 /// module's path. `base` is the importer; its last segment is dropped before
-/// applying `name`'s segments. A rooted base remains rooted after resolution.
+/// applying `name`'s segments.
 pub(crate) fn resolve_relative_specifier(base: &str, name: &str) -> String {
-    let rooted = base.starts_with('/');
     let mut segments: Vec<&str> = base
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -144,12 +137,7 @@ pub(crate) fn resolve_relative_specifier(base: &str, name: &str) -> String {
         }
     }
 
-    let resolved = segments.join("/");
-    if rooted {
-        format!("/{resolved}")
-    } else {
-        resolved
-    }
+    segments.join("/")
 }
 
 fn normalize_dynamic_module_name(base: &str, name: &str) -> Option<String> {
@@ -274,8 +262,6 @@ pub struct ModuleNames<'js> {
     _marker: PhantomData<&'js ()>,
 }
 
-// SAFETY: `ModuleNames` owns its strings; its `'js` parameter appears only in
-// `PhantomData` and does not guard a reference or a context-bound JS handle.
 unsafe impl<'js> JsLifetime<'js> for ModuleNames<'js> {
     /// Allows the module names to be tracked across different lifetimes.
     ///
@@ -350,8 +336,6 @@ pub struct GlobalAttachment {
 #[frb(ignore)]
 struct GlobalAttachmentInitialized {}
 
-// SAFETY: This zero-sized marker contains no references or context-bound
-// JavaScript handles, so it is valid for every JavaScript lifetime.
 unsafe impl<'js> JsLifetime<'js> for GlobalAttachmentInitialized {
     type Changed<'to> = GlobalAttachmentInitialized;
 }

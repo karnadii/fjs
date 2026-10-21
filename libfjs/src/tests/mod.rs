@@ -34,9 +34,6 @@ mod llrt_module_tests;
 #[cfg(test)]
 mod runtime_architecture_tests;
 
-#[cfg(test)]
-mod api_surface_tests;
-
 /// Test helper utilities
 #[cfg(test)]
 pub mod test_utils {

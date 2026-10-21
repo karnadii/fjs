@@ -17,8 +17,6 @@ impl RuntimeErrorSink {
     }
 }
 
-// SAFETY: `RuntimeErrorSink` owns only a Rust-side driver controller and no
-// references or context-bound JavaScript handles.
 unsafe impl<'js> JsLifetime<'js> for RuntimeErrorSink {
     type Changed<'to> = RuntimeErrorSink;
 }

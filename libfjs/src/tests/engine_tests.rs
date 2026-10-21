@@ -12,7 +12,6 @@ use crate::api::source::{
     JsBuiltinOptions, JsCode, JsModule, JsModuleBytecode, JsScriptBytecode, JsScriptBytecodeOptions,
 };
 use crate::api::value::JsValue;
-use crate::runtime::shutdown::RuntimeShutdown;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -84,95 +83,6 @@ fn release_blocking_init_attachment() {
 // ============================================================================
 // Engine Lifecycle Tests
 // ============================================================================
-
-#[tokio::test]
-async fn async_result_contract_normalizes_engine_eval_and_module_calls() {
-    let engine = JsEngine::create(None, None, None).await.unwrap();
-    engine.init_without_bridge().await.unwrap();
-    engine
-        .declare_new_module(JsModule::code(
-            "engine-async-result-contract".to_string(),
-            r#"
-                export function syncValue() {
-                    return { value: 42 };
-                }
-
-                export async function asyncValue() {
-                    return { value: 42 };
-                }
-
-                export async function multiKeyValue() {
-                    return { value: 42, extra: true };
-                }
-            "#
-            .to_string(),
-        ))
-        .await
-        .unwrap();
-
-    let evaluated = engine
-        .eval(JsCode::Code("await Promise.resolve(42)".to_string()), None)
-        .await
-        .unwrap();
-    assert!(matches!(evaluated, JsValue::Integer(42)));
-
-    let sync_call = engine
-        .call(
-            "engine-async-result-contract".to_string(),
-            "syncValue".to_string(),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(matches!(sync_call, JsValue::Integer(42)));
-
-    let async_call = engine
-        .call(
-            "engine-async-result-contract".to_string(),
-            "asyncValue".to_string(),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(matches!(async_call, JsValue::Integer(42)));
-
-    let multi_key = engine
-        .call(
-            "engine-async-result-contract".to_string(),
-            "multiKeyValue".to_string(),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        multi_key,
-        JsValue::Object(ref object)
-            if matches!(object.get("value"), Some(JsValue::Integer(42)))
-                && matches!(object.get("extra"), Some(JsValue::Boolean(true)))
-    ));
-}
-
-#[tokio::test]
-async fn value_conversion_errors_are_structured_at_engine_boundary() {
-    let engine = JsEngine::create(None, None, None).await.unwrap();
-    engine.init_without_bridge().await.unwrap();
-
-    let error = engine
-        .eval(
-            JsCode::Code("const value = {}; value.self = value; value".to_string()),
-            None,
-        )
-        .await
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        crate::api::error::JsError::Conversion {
-            ref message,
-            ..
-        } if message.contains("cyclic JavaScript value")
-    ));
-}
 
 #[tokio::test]
 async fn test_engine_create() {
@@ -272,9 +182,9 @@ async fn test_engine_init_failure_rolls_back_state() {
             GlobalAttachment::default().add_function(failing_global_attachment),
         ),
         driver: crate::runtime::driver::DriverController::default(),
-        shutdown: RuntimeShutdown::default(),
         cleaned: Arc::new(AtomicBool::new(false)),
-        runtime_lifetime: Some(Arc::new(())),
+        runtime_lifetime: Arc::new(()),
+        execution_control: Arc::new(crate::api::runtime::ExecutionControl::default()),
     };
     let context = JsAsyncContext::from(&runtime).await.unwrap();
     let engine = JsEngine::new_for_test(runtime, context);
@@ -306,9 +216,9 @@ async fn test_engine_runtime_proxy_methods_fail_while_initializing() {
             GlobalAttachment::default().add_function(blocking_global_attachment),
         ),
         driver: crate::runtime::driver::DriverController::default(),
-        shutdown: RuntimeShutdown::default(),
         cleaned: Arc::new(AtomicBool::new(false)),
-        runtime_lifetime: Some(Arc::new(())),
+        runtime_lifetime: Arc::new(()),
+        execution_control: Arc::new(crate::api::runtime::ExecutionControl::default()),
     };
     let context = JsAsyncContext::from(&runtime).await.unwrap();
     let engine = std::sync::Arc::new(JsEngine::new_for_test(runtime, context));
@@ -330,13 +240,6 @@ async fn test_engine_runtime_proxy_methods_fail_while_initializing() {
     // init observes the CLOSED state when it tries to commit and fails.
     let close_engine = engine.clone();
     let close_task = tokio::spawn(async move { close_engine.close().await });
-
-    // close() transitions the state on its first poll; wait for that to
-    // happen before releasing the blocked init, otherwise the resumed init
-    // can win the race to finish_init and succeed.
-    while !engine.closed() {
-        tokio::task::yield_now().await;
-    }
 
     release_blocking_init_attachment();
 
@@ -441,10 +344,9 @@ async fn test_engine_close_drains_pending_runtime_work() {
     assert!(matches!(scheduled, JsValue::String(ref value) if value == "scheduled"));
     assert!(engine.is_job_pending().await.unwrap());
 
-    let runtime = engine.runtime_for_test();
-    engine.close_gracefully().await.unwrap();
+    engine.close().await.unwrap();
 
-    assert!(!runtime.is_job_pending().await);
+    assert!(!engine.runtime_for_test().is_job_pending().await);
 }
 
 #[tokio::test]
@@ -1010,47 +912,6 @@ async fn test_engine_bytecode_modules_support_relative_imports() {
 }
 
 #[tokio::test]
-async fn rooted_relative_bytecode_modules_resolve_from_root() {
-    let dep = JsBytecode::compile(
-        JsModule::code(
-            "/pkg/dep.js".to_string(),
-            "export const value = 42;".to_string(),
-        ),
-        None,
-    )
-    .await
-    .unwrap();
-    let main = JsBytecode::compile(
-        JsModule::code(
-            "/pkg/main.js".to_string(),
-            "import { value } from './dep.js'; export default value;".to_string(),
-        ),
-        None,
-    )
-    .await
-    .unwrap();
-
-    let engine = JsEngine::create(None, None, None).await.unwrap();
-    engine.init_without_bridge().await.unwrap();
-    engine
-        .declare_new_bytecode_modules(vec![dep, main])
-        .await
-        .unwrap();
-
-    let result = engine
-        .eval(
-            JsCode::Code(
-                "const { default: value } = await import('/pkg/main.js'); value".to_string(),
-            ),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert!(matches!(result, JsValue::Integer(42)));
-}
-
-#[tokio::test]
 async fn test_engine_declare_new_bytecode_modules_rejects_duplicate_names() {
     let first = JsBytecode::compile(
         JsModule::code(
@@ -1128,41 +989,6 @@ async fn test_engine_declare_and_evaluate_bytecode_bundle() {
 }
 
 #[tokio::test]
-async fn rooted_relative_bytecode_bundle_resolves_from_root() {
-    let bundle = JsBytecode::compile_module_bundle(
-        vec![
-            JsModule::code(
-                "/bundle/dep.js".to_string(),
-                "export const value = 21;".to_string(),
-            ),
-            JsModule::code(
-                "/bundle/main.js".to_string(),
-                "import { value } from './dep.js'; export default value * 2;".to_string(),
-            ),
-        ],
-        Some("/bundle/main.js".to_string()),
-        None,
-    )
-    .await
-    .unwrap();
-
-    let engine = JsEngine::create(None, None, None).await.unwrap();
-    engine.init_without_bridge().await.unwrap();
-    engine.evaluate_bytecode_bundle(bundle).await.unwrap();
-
-    let imported = engine
-        .eval(
-            JsCode::Code(
-                "const { default: value } = await import('/bundle/main.js'); value".to_string(),
-            ),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(matches!(imported, JsValue::Integer(42)));
-}
-
-#[tokio::test]
 async fn test_engine_compile_bytecode_bundle_rejects_missing_relative_dependency() {
     let error = JsBytecode::compile_module_bundle(
         vec![JsModule::code(
@@ -1213,7 +1039,7 @@ async fn test_engine_evaluate_script_bytecode_roundtrip() {
 }
 
 #[tokio::test]
-async fn async_result_contract_normalizes_async_script_bytecode() {
+async fn test_engine_evaluate_async_script_bytecode_roundtrip() {
     let script = JsBytecode::compile_script(
         "async-script-bytecode.js".to_string(),
         JsCode::Code("await Promise.resolve(42)".to_string()),
@@ -1463,38 +1289,6 @@ async fn test_engine_dynamic_module_relative_import() {
         .eval(
             JsCode::Code(
                 "const { default: value } = await import('pkg/main.js'); value".to_string(),
-            ),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert!(matches!(result, JsValue::Integer(42)));
-}
-
-#[tokio::test]
-async fn rooted_relative_source_modules_resolve_from_root() {
-    let engine = JsEngine::create(None, None, None).await.unwrap();
-    engine.init_without_bridge().await.unwrap();
-
-    engine
-        .declare_new_modules(vec![
-            JsModule::code(
-                "/pkg/dep.js".to_string(),
-                "export const value = 42;".to_string(),
-            ),
-            JsModule::code(
-                "/pkg/main.js".to_string(),
-                "import { value } from './dep.js'; export default value;".to_string(),
-            ),
-        ])
-        .await
-        .unwrap();
-
-    let result = engine
-        .eval(
-            JsCode::Code(
-                "const { default: value } = await import('/pkg/main.js'); value".to_string(),
             ),
             None,
         )

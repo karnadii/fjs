@@ -3,6 +3,22 @@ include: package:flutter_lints/flutter.yaml
 analyzer:
   exclude:
     - lib/src/frb/**
+    # Cargo build plumbing vendored inside the fjs path dependency.
+    # `cargokit/build_tool` is a standalone Dart package (its own
+    # pubspec, pubspec.lock, and analysis_options) whose dependencies —
+    # version, hex, github, toml, ed25519_edwards — are not part of
+    # mathnote's package graph and are never resolved here, so every
+    # file reports `uri_does_not_exist`. `test_driver` is an
+    # integration_test driver, which is likewise outside the analysis
+    # graph. Both are Cargo build plumbing, not mathnote source.
+    #
+    # These must be listed HERE rather than only in the repository-root
+    # analysis_options.yaml: a nested analysis_options.yaml starts a new
+    # analysis context, and the parent's exclude list does not carry
+    # into it. The root file already excludes `packages/fjs/cargokit/**`
+    # and `packages/fjs/test_driver/**` for the same reason.
+    - cargokit/**
+    - test_driver/**
     - build/**
     - android/**
     - ios/**
