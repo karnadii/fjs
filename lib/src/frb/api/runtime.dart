@@ -88,8 +88,10 @@ abstract class JsAsyncContext implements RustOpaqueInterface {
   ///
   /// - If file cannot be read
   /// - If code evaluation fails
-  Future<JsResult> evalFileWithOptions(
-      {required String path, required JsEvalOptions options});
+  Future<JsResult> evalFileWithOptions({
+    required String path,
+    required JsEvalOptions options,
+  });
 
   /// Evaluates a function from a module.
   ///
@@ -121,14 +123,18 @@ abstract class JsAsyncContext implements RustOpaqueInterface {
   /// );
   /// print(result.value); // 3
   /// ```
-  Future<JsResult> evalFunction(
-      {required String module, required String method, List<JsValue>? params});
+  Future<JsResult> evalFunction({
+    required String module,
+    required String method,
+    List<JsValue>? params,
+  });
 
   /// Evaluates JavaScript with a host visible deadline and cancellation id.
-  Future<JsResult> evalWithBudget(
-      {required String code,
-      required BigInt timeoutMs,
-      required BigInt requestId});
+  Future<JsResult> evalWithBudget({
+    required String code,
+    required BigInt timeoutMs,
+    required BigInt requestId,
+  });
 
   /// Evaluates JavaScript code with options.
   ///
@@ -148,8 +154,10 @@ abstract class JsAsyncContext implements RustOpaqueInterface {
   ///
   /// - If code evaluation fails
   /// - If global attachment fails
-  Future<JsResult> evalWithOptions(
-      {required String code, required JsEvalOptions options});
+  Future<JsResult> evalWithOptions({
+    required String code,
+    required JsEvalOptions options,
+  });
 
   /// Creates a new async context from a runtime.
   ///
@@ -210,10 +218,13 @@ abstract class JsAsyncRuntime implements RustOpaqueInterface {
   ///   ],
   /// );
   /// ```
-  static Future<JsAsyncRuntime> create(
-          {JsBuiltinOptions? builtins, List<JsModule>? modules}) =>
-      LibFjs.instance.api.crateApiRuntimeJsAsyncRuntimeCreate(
-          builtins: builtins, modules: modules);
+  static Future<JsAsyncRuntime> create({
+    JsBuiltinOptions? builtins,
+    List<JsModule>? modules,
+  }) => LibFjs.instance.api.crateApiRuntimeJsAsyncRuntimeCreate(
+    builtins: builtins,
+    modules: modules,
+  );
 
   /// Returns memory usage statistics.
   ///
@@ -378,8 +389,10 @@ abstract class JsContext implements RustOpaqueInterface {
   /// - If promise option is enabled (not supported in sync context)
   /// - If file cannot be read
   /// - If code evaluation fails
-  JsResult evalFileWithOptions(
-      {required String path, required JsEvalOptions options});
+  JsResult evalFileWithOptions({
+    required String path,
+    required JsEvalOptions options,
+  });
 
   /// Evaluates JavaScript code with options.
   ///
@@ -399,8 +412,10 @@ abstract class JsContext implements RustOpaqueInterface {
   ///
   /// - If promise option is enabled (not supported in sync context)
   /// - If code evaluation fails
-  JsResult evalWithOptions(
-      {required String code, required JsEvalOptions options});
+  JsResult evalWithOptions({
+    required String code,
+    required JsEvalOptions options,
+  });
 
   /// Evaluates synchronous JavaScript with a QuickJS interrupt deadline.
   JsResult evalWithTimeout({required String code, required BigInt timeoutMs});
@@ -463,10 +478,13 @@ abstract class JsRuntime implements RustOpaqueInterface {
   ///   ],
   /// );
   /// ```
-  static Future<JsRuntime> create(
-          {JsBuiltinOptions? builtins, List<JsModule>? modules}) =>
-      LibFjs.instance.api
-          .crateApiRuntimeJsRuntimeCreate(builtins: builtins, modules: modules);
+  static Future<JsRuntime> create({
+    JsBuiltinOptions? builtins,
+    List<JsModule>? modules,
+  }) => LibFjs.instance.api.crateApiRuntimeJsRuntimeCreate(
+    builtins: builtins,
+    modules: modules,
+  );
 
   /// Executes one pending QuickJS job.
   ///
