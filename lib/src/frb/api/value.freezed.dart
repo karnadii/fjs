@@ -793,7 +793,7 @@ class _$JsValue_BytesCopyWithImpl<$Res>
 /// @nodoc
 
 class JsValue_Array extends JsValue {
-  const JsValue_Array(final List<JsValue> field0)
+  const JsValue_Array(List<JsValue> field0)
       : _field0 = field0,
         super._();
 
@@ -865,7 +865,7 @@ class _$JsValue_ArrayCopyWithImpl<$Res>
 /// @nodoc
 
 class JsValue_Object extends JsValue {
-  const JsValue_Object(final Map<String, JsValue> field0)
+  const JsValue_Object(Map<String, JsValue> field0)
       : _field0 = field0,
         super._();
 

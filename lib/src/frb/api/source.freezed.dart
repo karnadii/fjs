@@ -2685,7 +2685,7 @@ extension JsModuleBytecodeBundlePatterns on JsModuleBytecodeBundle {
 
 class _JsModuleBytecodeBundle extends JsModuleBytecodeBundle {
   const _JsModuleBytecodeBundle(
-      {this.entry, required final List<JsModuleBytecode> modules})
+      {this.entry, required List<JsModuleBytecode> modules})
       : _modules = modules,
         super._();
 
